@@ -1,0 +1,18 @@
+{
+    "sourceFile": "test.ps1",
+    "activeCommit": 0,
+    "commits": [
+        {
+            "activePatchIndex": 0,
+            "patches": [
+                {
+                    "date": 1789749838378,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n"
+                }
+            ],
+            "date": 1789749838378,
+            "name": "Commit-0",
+            "content": "$body = Get-Content \"C:\\Users\\AS RUMON\\Desktop\\buphack\\buphackathon\\test.json\" -Raw\r\n$response = Invoke-RestMethod -Uri \"https://smart-campus-energy-optimizer.asrumon.workers.dev/optimize-energy\" -Method Post -ContentType \"application/json\" -Body $body\r\n$response | ConvertTo-Json -Depth 10"
+        }
+    ]
+}
