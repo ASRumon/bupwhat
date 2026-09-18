@@ -1,6 +1,6 @@
 // ============================================================================
 // src/llmInterpreter.ts — LLM directive interpreter.
-//   Primary: Gemini (multi-model fallback: gemini-3.6-flash -> gemini-3.5-flash-lite)
+//   Primary: Gemini (multi-model fallback: gemini-2.0-flash -> gemini-2.5-flash -> gemini-2.0-flash-lite)
 //   Fallback: OpenAI gpt-4o-mini
 // ============================================================================
 
@@ -18,14 +18,16 @@ import {
   validateDirectiveOutput,
 } from "./guardrailValidator";
 
-const REQUEST_TIMEOUT_MS = 8000;
+const REQUEST_TIMEOUT_MS = 8000; // bumped from 5s — Gemini 2.x can be slower
 
 // ----------------------------------------------------------------------------
 // Model names — ordered fallback list per provider.
-//   NOTE: gemini-2.0-* and gemini-2.5-flash are 404 on v1beta as of 2026-09.
-//   Live models are 3.6-flash and 3.5-flash-lite.
+// Do NOT use gemini-1.5-* — those have been removed from the v1beta endpoint.
 // ----------------------------------------------------------------------------
 const GEMINI_MODELS: string[] = [
+  "gemini-2.0-flash",
+  "gemini-2.5-flash",
+  "gemini-2.0-flash-lite",
   "gemini-3.6-flash",
   "gemini-3.5-flash-lite",
 ];
@@ -37,9 +39,11 @@ const OPENAI_MODEL = "gpt-4o-mini";
 
 export function stripMarkdownWrappers(raw: string): string {
   let s = raw.trim();
+  // Strip ```json ... ``` or ``` ... ```
   s = s.replace(/^```(?:json)?\s*/i, "");
   s = s.replace(/\s*```$/i, "");
   s = s.trim();
+  // Strip stray backticks
   s = s.replace(/^`+|`+$/g, "").trim();
   return s;
 }
@@ -136,7 +140,7 @@ Re-emit the FULL JSON object with ALL entries. Do not omit anything.`;
 }
 
 // ============================================================================
-// Gemini response schema
+// Gemini response schema (JSON-schema-lite for the v1beta generateContent API)
 // ============================================================================
 
 function geminiResponseSchema(): Record<string, unknown> {
@@ -251,6 +255,7 @@ async function callGemini(
 
   if (!res.ok) {
     const text = await res.text().catch(() => "");
+    // Surface the real error to wrangler tail
     console.error(
       `[gemini:${model}] HTTP ${res.status}: ${text.slice(0, 500)}`
     );
@@ -319,7 +324,7 @@ async function callOpenAI(
     console.error(`[openai] empty response body`);
     throw new Error("openai_empty_response");
   }
-  return { rawText: text, provider: `openai:${OPENAI_MODEL}` }; // ← CHANGED: was hardcoded "openai:gpt-4o-mini"
+  return { rawText: text, provider: "openai:gpt-4o-mini" };
 }
 
 // ============================================================================
@@ -334,7 +339,6 @@ async function callLLMWithFallback(
 ): Promise<LLMCallResult> {
   const userMessage = buildUserMessage(req, ctx, corrective);
   const errors: string[] = [];
-  const startedAt = Date.now(); // ← NEW
 
   const geminiKeys: Array<{ name: string; key: string | undefined }> = [
     { name: "GEMINI_API_KEY_1", key: env.GEMINI_API_KEY_1 },
@@ -349,18 +353,15 @@ async function callLLMWithFallback(
     }
     for (const model of GEMINI_MODELS) {
       try {
-        const result = await callGemini(key, model, userMessage);
-        // ← NEW: success log with provider, key, attempts-so-far, elapsed
-        console.log(
-          `[fallback] ✅ SUCCESS via ${result.provider} (key=${name}, attempt=${
-            errors.length + 1
-          }, elapsed=${Date.now() - startedAt}ms)`
-        );
-        return result;
+        return await callGemini(key, model, userMessage);
       } catch (e) {
         const msg = (e as Error).message;
         console.error(`[fallback] ${name}/${model} failed: ${msg}`);
         errors.push(`${name}/${model}: ${msg}`);
+        // 404 = model gone, try next model.
+        // 400 = bad request, unlikely to help by retrying.
+        // 429 = rate limit, skip to next model.
+        // Continue the loop regardless.
       }
     }
   }
@@ -368,14 +369,7 @@ async function callLLMWithFallback(
   // OpenAI fallback
   if (env.OPENAI_API_KEY) {
     try {
-      const result = await callOpenAI(env.OPENAI_API_KEY, userMessage);
-      // ← NEW: success log for OpenAI path
-      console.log(
-        `[fallback] ✅ SUCCESS via ${result.provider} (attempt=${
-          errors.length + 1
-        }, elapsed=${Date.now() - startedAt}ms)`
-      );
-      return result;
+      return await callOpenAI(env.OPENAI_API_KEY, userMessage);
     } catch (e) {
       const msg = (e as Error).message;
       console.error(`[fallback] OPENAI/${OPENAI_MODEL} failed: ${msg}`);
@@ -384,13 +378,6 @@ async function callLLMWithFallback(
   } else {
     errors.push("OPENAI_API_KEY: not configured");
   }
-
-  // ← NEW: log the full failure summary before throwing
-  console.error(
-    `[fallback] ❌ ALL PROVIDERS FAILED after ${
-      errors.length
-    } attempt(s), elapsed=${Date.now() - startedAt}ms: ${errors.join(" | ")}`
-  );
 
   throw new ApiError(
     500,
@@ -452,20 +439,11 @@ export async function interpretNotes(
         ok: false,
         errors: [`JSON parse/shape error: ${(e as Error).message}`],
       };
-      console.error(
-        `[interpretNotes] attempt ${attempt} JSON parse failed via ${lastProvider}: ${(e as Error).message}`
-      );
       continue;
     }
 
     const validation = validateDirectiveOutput(parsed, guardrailCtx);
     if (validation.ok) {
-      // ← NEW: final success log (this is the line that matters most)
-      console.log(
-        `[interpretNotes] ✅ SUCCESS via ${lastProvider} on attempt ${attempt} (${req.operator_notes.length} note(s) → ${parsed.directive_interpretation.length} entr${
-          parsed.directive_interpretation.length === 1 ? "y" : "ies"
-        })`
-      );
       const entries: DirectiveEntry[] = parsed.directive_interpretation.map(
         (entry, idx) => ({
           ...entry,
@@ -474,18 +452,11 @@ export async function interpretNotes(
       );
       return { entries, provider: lastProvider, attempts: attempt };
     }
-
-    console.error(
-      `[interpretNotes] attempt ${attempt} guardrail failed via ${lastProvider}: ${validation.errors.join(" | ")}`
-    );
     lastValidationResult = validation;
   }
 
   const errText =
     lastValidationResult?.errors.join(" | ") ?? "guardrail_validation_failed";
-  console.error(
-    `[interpretNotes] ❌ FAILED after 2 attempts via ${lastProvider}: ${errText}`
-  );
   throw new ApiError(
     422,
     "guardrail_failure",
